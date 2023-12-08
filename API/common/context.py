@@ -165,12 +165,14 @@ def log_dependency_call(callName):
                 tracer = context.tracer
                 with tracer.span(name=callName) as span:
                     span.add_attribute("name", callName)
+                    dependencyCall.request = args[2] if len(args) > 2 else kwargs['user_msg']
                     response = func(*args, **kwargs)
                     if 'usage' in response:
                         dependencyCall.usage = response['usage']
                         for key, value in response['usage'].items():
                             span.add_attribute(f"{key}", value)
                         response = response['content']
+                        dependencyCall.response = response
             except Exception as e:
                 tracebackStr = traceback.format_exc()
                 logging.error(tracebackStr)

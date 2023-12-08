@@ -85,12 +85,15 @@ def trim_command_and_chunk_with_invalid_params(command, chunk):
     """
     chunk_copy = chunk.copy()
     cmd_sig, params = parse_command_info(command)
+    positional_params = []
     cmd_params = []
     unmatched_params = []
     # traverse all params in command, and pop the correct param from chunk
     for param in params:
         if _pop_param_in_chunk(param, chunk_copy):
             cmd_params.append(param)
+        elif re.match(r'<.+>', param):
+            positional_params.append(param)
         else:
             unmatched_params.append(param)
     # all used required params are popped from chunk.
@@ -103,7 +106,7 @@ def trim_command_and_chunk_with_invalid_params(command, chunk):
         similar_params = _find_top_n_similar_params(param, chunk['optional parameters'])
         chunk_copy['optional parameters'].extend(similar_params)
     chunk_copy['optional parameters'] = _dedup_param_group(chunk_copy['optional parameters'])
-    valid_cmd = cmd_sig + ' ' + ' '.join(cmd_params)
+    valid_cmd = f'{cmd_sig} {" ".join(positional_params)} {" ".join(cmd_params)}'
     return valid_cmd, chunk_copy
 
 

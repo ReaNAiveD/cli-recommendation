@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 from enum import Enum
 from json import JSONDecodeError
+from typing import List
 
 import azure.functions as func
 from cli_validator.result import CommandSource
@@ -20,7 +22,9 @@ from common.service_impl.learn_knowledge_index import (filter_chunks_by_keyword_
                                                        retrieve_chunks_for_atomic_task,
                                                        trim_command_and_chunk_with_invalid_params)
 from common.telemetry import telemetry
-from common.util import generate_response, get_param, get_param_enum, get_param_int, get_param_str
+from common.util import get_param_str, get_param_int, get_param_enum, get_param, generate_response, parse_command_info
+
+from common import validate_command_in_task
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +140,11 @@ async def _build_task_context(raw_task, token):
             # Or if the command is in extension
             # keep all correct parameters in guide step and suggest the possible correct parameters in the context chunk
             chunk = await retrieve_chunk_for_command(cmd, token)
+            missing_match = re.match(r'the following arguments are required: (?P<args>.+)', validate_result.error_message)
+            if missing_match:
+                missing_args = missing_match.groupdict()['args'].split(', ')
+                missing_options = [arg.split('/')[0] for arg in missing_args if arg]
+                cmd = _insert_arg_in_command(cmd, missing_options)
             if chunk:
                 task, chunk = trim_command_and_chunk_with_invalid_params(cmd, chunk)
                 chunks = [chunk]
@@ -186,3 +195,10 @@ def _build_scenario_response(content):
 
 def _join_chunks_in_context(context_info_list):
     return [chunk for context_info in context_info_list for chunk in context_info[1]]
+
+
+def _insert_arg_in_command(cmd: str, args: List[str]):
+    sig, old_args = parse_command_info(cmd)
+    args = args + old_args
+    args = [arg for arg in args if arg.startswith('<')] + [arg for arg in args if arg.startswith('-')]
+    return f'{sig} {" ".join(args)}'

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 
 from enum import Enum
 import azure.functions as func
@@ -98,6 +99,9 @@ def parse_command_info(command_info):
     for item in command_items:
         if item.startswith('-'):
             arguments_start = True
+            arguments_part.append(item)
+        elif re.match(r'<.+>', item) and not arguments_start:
+            # Handle Positional Arg
             arguments_part.append(item)
         elif not arguments_start:
             command_part.append(item)
