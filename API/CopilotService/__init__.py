@@ -161,9 +161,10 @@ async def _build_task_context(raw_task, token):
 
 
 def _add_context_to_queston(context, question, task_list, usage_context):
-    context.custom_context.task_list_lens = len(task_list)
-    context.custom_context.estimated_task_list_tokens = num_tokens_from_message(task_list)
-    context.custom_context.estimated_usage_context_tokens = num_tokens_from_message(usage_context)
+    if task_list and usage_context:
+        context.custom_context.task_list_lens = len(task_list)
+        context.custom_context.estimated_task_list_tokens = num_tokens_from_message(task_list)
+        context.custom_context.estimated_usage_context_tokens = num_tokens_from_message(usage_context)
     if task_list:
         guiding_steps_separation = "\nHere are the steps you can refer to for this question:\n"
         question = question + guiding_steps_separation + str(task_list) + '\n'
