@@ -8,11 +8,13 @@ from json import JSONDecodeError
 from typing import List
 
 import azure.functions as func
+from azure.core.exceptions import HttpResponseError
 from cli_validator.result import CommandSource
 from common import validate_command_in_task
 from common.auth import get_auth_token_for_learn_knowlegde_index, verify_token
 from common.correct import correct_scenario
-from common.exception import CopilotException, GPTInvalidResultException, ParameterException
+from common.exception import GPTInvalidResultException, KnowledgeSearchException, RequestException, \
+    QuestionOutOfScopeException, ServiceException
 from common.prompt import DEFAULT_GENERATE_SCENARIO_MSG, DEFAULT_SPLIT_TASK_MSG
 from common.service_impl.chatgpt import gpt_generate, num_tokens_from_message
 from common.service_impl.knowledge_base import knowledge_search, pass_verification
@@ -22,8 +24,8 @@ from common.service_impl.learn_knowledge_index import (filter_chunks_by_keyword_
                                                        retrieve_chunks_for_atomic_task,
                                                        trim_command_and_chunk_with_invalid_params)
 from common.telemetry import telemetry
-from common.util import get_param_str, get_param_int, get_param_enum, get_param, generate_response, parse_command_info
-
+from common.util import generate_response
+from common.param import get_param, get_param_enum, get_param_int, get_param_str
 from common import validate_command_in_task
 
 logger = logging.getLogger(__name__)
@@ -43,43 +45,68 @@ def main(req: func.HttpRequest, context: func.Context) -> func.HttpResponse:
         history = get_param(req, 'history', default=[])
         top_num = get_param_int(req, 'top_num', default=5)
         service_type = get_param_enum(req, 'type', ServiceType, default=os.environ.get("DEFAULT_SERVICE_TYPE", ServiceType.GPT_GENERATION))
-    except ParameterException as e:
-        logger.error(f'Response Status 400: ParameterException: {e.msg}')
-        return func.HttpResponse(e.msg, status_code=400)
+
+        result = copilot_service(context, question, history, top_num, service_type)
+    except RequestException as e:
+        logger.error(f'Error: UserException: {e.msg}', exc_info=e)
+        return func.HttpResponse(e.to_response_body(), status_code=400)
+    except ServiceException as e:
+        logger.error(f'Error: ServiceException: {e.msg}', exc_info=e)
+        return func.HttpResponse(e.to_response_body(), status_code=500)
+    except Exception as e:
+        logger.error(f'Unexpected Error: {str(e)}', exc_info=e)
+        return func.HttpResponse(generate_response(
+            [], 500,
+            'We encountered an unexpected error while processing your request. '
+            'Please try again later or contact our support team for assistance.'), status_code=500)
+    return func.HttpResponse(generate_response(result, 200))
+
+
+def copilot_service(context, question, history, top_num=5, service_type=ServiceType.GPT_GENERATION):
 
     system_msg = os.environ.get("OPENAI_GENERATE_SCENARIO_MSG", default=DEFAULT_GENERATE_SCENARIO_MSG)
 
-    try:
-        result = []
-        if service_type == ServiceType.KNOWLEDGE_SEARCH:
+    result = []
+    if service_type == ServiceType.KNOWLEDGE_SEARCH:
+        try:
             result = knowledge_search(question, top_num)
             if len(result) == 0 or not pass_verification(context, question, result):
                 result = []
+        except HttpResponseError as e:
+            raise KnowledgeSearchException() from e
 
-            return func.HttpResponse(generate_response(result, 200))
+        return result
 
-        if os.environ.get('ENABLE_RETRIEVAL_AUGMENTED_GENERATION', "true").lower() == "true":
-            task_list, usage_context = asyncio.run(_retrieve_context_from_learn_knowledge_index(context, question))
-            question = _add_context_to_queston(context, question, task_list, usage_context)
+    if os.environ.get('ENABLE_RETRIEVAL_AUGMENTED_GENERATION', "true").lower() == "true":
+        logger.info(f'Starting the Retrieval Augmented Generation (RAG) process.')
+        task_list, usage_context = asyncio.run(_retrieve_context_from_learn_knowledge_index(context, question))
+        token_limit = int(os.environ.get("CONTEXT_TOKEN_LIMIT", 4096))
+        completion_tokens = int(os.environ.get('OPENAI_MAX_TOKENS', 4000))   # The default value should be the same as the one in initialize_chatgpt_service_params
+        factor = float(os.environ.get('ESTIMATION_ADJUSTMENT_FACTOR', 0.95))
+        system_msg_tokens = num_tokens_from_message(system_msg) or 0
+        token_remains = (token_limit - completion_tokens) * factor - system_msg_tokens
+        question = _add_context_to_queston(context, question, task_list, usage_context, token_limit=token_remains)
+        logger.info(f'Successfully completed the RAG process.')
 
-        if service_type == ServiceType.GPT_GENERATION:
+    if service_type == ServiceType.GPT_GENERATION:
+        context.custom_context.gpt_task_name = 'GENERATE_SCENARIO'
+        gpt_result = gpt_generate(context, system_msg, question, history)
+        result = [_build_scenario_response(gpt_result)] if gpt_result else []
+
+    elif service_type == ServiceType.MIX:
+        try:
+            result = knowledge_search(question, top_num)
+        except HttpResponseError as e:
+            logger.error('Error from knowledge search: \n%s', e, exc_info=e)
+            result = []
+
+        if len(result) == 0 or not pass_verification(context, question, result):
             context.custom_context.gpt_task_name = 'GENERATE_SCENARIO'
             gpt_result = gpt_generate(context, system_msg, question, history)
             result = [_build_scenario_response(gpt_result)] if gpt_result else []
 
-        elif service_type == ServiceType.MIX:
-            result = knowledge_search(question, top_num)
-
-            if len(result) == 0 or not pass_verification(context, question, result):
-                context.custom_context.gpt_task_name = 'GENERATE_SCENARIO'
-                gpt_result = gpt_generate(context, system_msg, question, history)
-                result = [_build_scenario_response(gpt_result)] if gpt_result else []
-
-        result = [correct_scenario(s) for s in result]
-    except CopilotException as e:
-        logger.error(f'Response Status 500: CopilotException: {e.msg}')
-        return func.HttpResponse(e.msg, status_code=500)
-    return func.HttpResponse(generate_response(result, 200))
+    result = [correct_scenario(s) for s in result]
+    return result
 
 
 async def _retrieve_context_from_learn_knowledge_index(context, question):
@@ -87,7 +114,7 @@ async def _retrieve_context_from_learn_knowledge_index(context, question):
     context.custom_context.gpt_task_name = 'SPLIT_TASK'
     generate_results = gpt_generate(context, system_msg, question, history_msg=[])
     try:
-        raw_task_list = _build_scenario_response(generate_results)
+        raw_task_list = _build_json_output(generate_results)
     except Exception as e:
         logger.error(f"Error while parsing the generate results: {generate_results}, {e}")
         return None, None
@@ -167,19 +194,31 @@ def _add_context_to_queston(context, question, task_list, usage_context):
         context.custom_context.estimated_usage_context_tokens = num_tokens_from_message(usage_context)
     if task_list:
         guiding_steps_separation = "\nHere are the steps you can refer to for this question:\n"
-        question = question + guiding_steps_separation + str(task_list) + '\n'
+        question = _try_add_steps_to_queston(question, guiding_steps_separation, task_list, token_limit)
     if usage_context:
         commands_info_separation = "\nBelow are some potentially relevant CLI commands information as context, please select the commands information that may be used in the scenario of the question from context, and supplement the missing commands information of context\n"
-        question = question + commands_info_separation + str(usage_context)
+        question = _try_add_steps_to_queston(question, commands_info_separation, usage_context, token_limit)
     return question
 
 
-def _build_scenario_response(content):
+def _try_add_steps_to_queston(question, intro, steps, token_limit):
+    if not steps:
+        return question
+    new_steps = [f'\n{intro}\n{str(steps[0])}'] + steps[1:]
+    new_steps = ['\n' + str(step) for step in new_steps]
+    for step in new_steps:
+        if (num_tokens_from_message(question + step) or 0) > token_limit:
+            return question
+        question += step
+    return question
+
+
+def _build_json_output(content):
     if not content:
-        return None
+        raise QuestionOutOfScopeException('Sorry, the question is out of scope. ')
     if content and content[0].isalpha() and ('sorry' in content.lower() or 'apolog' in content.lower()):
         logger.info(f"OpenAI Apology Output: {content}")
-        return None
+        raise QuestionOutOfScopeException(content)
 
     try:
         # If only single quotes exist, replace them with double quotes.
@@ -188,14 +227,30 @@ def _build_scenario_response(content):
         # In other cases, convert directly to json
         else:
             content = json.loads(content)
-        return _map_unknown_to_step(content)
+        return content
     except JSONDecodeError as e:
         logger.error(f"JSONDecodeError: {content}")
         raise GPTInvalidResultException from e
 
 
+def _build_scenario_response(content):
+    return _handle_scenario(_build_json_output(content))
+
+
+def _handle_scenario(scenario):
+    scenario = _ensure_command_set(scenario)
+    scenario = _map_unknown_to_step(scenario)
+    return scenario
+
+
+def _ensure_command_set(scenario):
+    if 'commandSet' not in scenario:
+        scenario['commandSet'] = []
+    return scenario
+
+
 def _map_unknown_to_step(scenario):
-    for cmd in scenario["commandSet"]:
+    for cmd in scenario.get("commandSet", []):
         if "command" in cmd and not cmd["command"].startswith("az "):
             cmd["step"] = cmd["command"]
             cmd.pop("command")
